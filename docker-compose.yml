@@ -1,0 +1,51 @@
+services:
+  origin:
+    build: .
+    command: python -m app.origin
+    environment:
+      ORIGIN_PORT: "8081"
+      REJECT_AFTER_BYTES: "4096"
+      IDLE_TIMEOUT: "30"
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8081), 2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build: .
+    command: python -m app.gateway
+    depends_on:
+      origin:
+        condition: service_healthy
+    environment:
+      GATEWAY_PORT: "8080"
+      ORIGIN_HOST: "origin"
+      ORIGIN_PORT: "8081"
+      PERMISSION_TIMEOUT: "3"
+      IDLE_TIMEOUT: "30"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8080), 2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  demo:
+    build: .
+    command: python -m app.demo
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment:
+      DEMO_PORT: "8000"
+      GATEWAY_HOST: "gateway"
+      GATEWAY_PORT: "8080"
+      ORIGIN_HOST: "origin"
+      ORIGIN_PORT: "8081"
+      PERMISSION_TIMEOUT: "3"
+    ports:
+      - "8000:8000"

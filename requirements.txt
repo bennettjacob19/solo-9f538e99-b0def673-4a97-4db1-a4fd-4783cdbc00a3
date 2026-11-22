@@ -1,0 +1,4 @@
+h11==0.16.0
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
+httpx==0.28.1
