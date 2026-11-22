@@ -7,6 +7,12 @@
   3. 中途拒收（/reject-mid）：终端收 413 且无需发完，源站只收到阈值附近字节
   4. 许可超时（/hang）：网关回 504，正文 0 字节，源站实收 0 字节
   5. 非法请求（缺 Expect / Content-Length）：网关直接 4xx
+  6. SHA-256 校验入口（/verify）：
+     a. 正确摘要：跨块计算 → 201，三份摘要相同，成功计数 +1
+     b. 错误摘要：422，成功计数不增
+     c. 缺摘要头：422，成功计数不增
+     d. 终端未发完就断开：不计成功
+     e. 源站中途拒收：413，不计成功，终端无需发完
 
 直接运行：``python scripts/selftest.py``（需在仓库根目录、依赖已安装）。
 """
@@ -14,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sys
 from pathlib import Path
 
@@ -37,6 +44,12 @@ def _check(label: str, condition: bool, detail: str = "") -> bool:
     mark = PASS if condition else FAIL
     print(f"  [{mark}] {label}" + (f" —— {detail}" if detail else ""))
     return condition
+
+
+def _synthetic_body(size: int) -> bytes:
+    pattern = b"diagnostic-package/0123456789\n"
+    full, rest = divmod(size, len(pattern))
+    return pattern * full + pattern[:rest]
 
 
 async def run() -> int:
@@ -152,6 +165,95 @@ async def run() -> int:
             _check("缺 Content-Length → 411", s2 == 411, f"实际 {s2}"),
         ]
         failures += not all(ok)
+
+        # ------------------------------------------- 6. SHA-256 校验入口
+        print("场景 6a：/verify 正确摘要（跨块计算，50KB，奇数分块）")
+        body = _synthetic_body(50_000)
+        good = hashlib.sha256(body).hexdigest()
+        wrong = hashlib.sha256(b"not-the-body").hexdigest()
+        await harness.stats.reset()
+        r = await upload_once(host, port, "/verify", len(body),
+                              body=body, digest_value=good)
+        stats = await harness.stats.snapshot()
+        payload = _json(r.response_body)
+        ok = [
+            _check("收到 100", r.got_100),
+            _check("最终状态码 201", r.status_code == 201,
+                   f"实际 {r.status_code}"),
+            _check("三份摘要一致",
+                   payload.get("declared_sha256") == good
+                   and payload.get("gateway_sha256") == good
+                   and payload.get("origin_sha256") == good,
+                   f"declared={payload.get('declared_sha256')} "
+                   f"gateway={payload.get('gateway_sha256')} "
+                   f"origin={payload.get('origin_sha256')}"),
+            _check("源站成功计数 +1", stats.get("verified_success") == 1,
+                   f"verified_success={stats.get('verified_success')}"),
+            _check("源站实收完整正文",
+                   stats["body_bytes"].get("/verify") == len(body),
+                   f"统计 {stats['body_bytes']}"),
+        ]
+        failures += not all(ok)
+
+        print("场景 6b：/verify 错误摘要（应 422、不计成功）")
+        await harness.stats.reset()
+        r = await upload_once(host, port, "/verify", len(body),
+                              body=body, digest_value=wrong)
+        stats = await harness.stats.snapshot()
+        ok = [
+            _check("最终状态码 422", r.status_code == 422,
+                   f"实际 {r.status_code}"),
+            _check("成功计数仍为 0", stats.get("verified_success") == 0,
+                   f"verified_success={stats.get('verified_success')}"),
+            _check("失败计数 +1", stats.get("verified_failure") == 1),
+        ]
+        failures += not all(ok)
+
+        print("场景 6c：/verify 缺摘要头（应 422、不计成功）")
+        await harness.stats.reset()
+        r = await upload_once(host, port, "/verify", len(body), body=body)
+        stats = await harness.stats.snapshot()
+        ok = [
+            _check("最终状态码 422", r.status_code == 422,
+                   f"实际 {r.status_code}"),
+            _check("成功计数仍为 0", stats.get("verified_success") == 0),
+        ]
+        failures += not all(ok)
+
+        print("场景 6d：/verify 终端未发完即断开（不计成功）")
+        await harness.stats.reset()
+        await _abandon_upload(host, port, "/verify", good, send_first=50_000)
+        await asyncio.sleep(0.2)
+        stats = await harness.stats.snapshot()
+        ok = [
+            _check("成功计数仍为 0", stats.get("verified_success") == 0,
+                   f"verified_success={stats.get('verified_success')}"),
+            _check("源站未收完整正文",
+                   stats["body_bytes"].get("/verify", 0) < 1_000_000,
+                   f"统计 {stats['body_bytes']}"),
+        ]
+        failures += not all(ok)
+
+        print("场景 6e：/verify-reject-mid 源站中途拒收（413、不计成功）")
+        big = _synthetic_body(200_000)
+        big_good = hashlib.sha256(big).hexdigest()
+        await harness.stats.reset()
+        r = await upload_once(host, port, "/verify-reject-mid", len(big),
+                              body=big, digest_value=big_good)
+        await asyncio.sleep(0.2)
+        stats = await harness.stats.snapshot()
+        origin_received = stats["body_bytes"].get("/verify-reject-mid", 0)
+        ok = [
+            _check("最终状态码 413", r.status_code == 413,
+                   f"实际 {r.status_code}"),
+            _check("终端未发完即中止", r.body_bytes_sent < len(big),
+                   f"已发 {r.body_bytes_sent} / {len(big)}"),
+            _check("成功计数仍为 0", stats.get("verified_success") == 0),
+            _check("源站只读到阈值附近字节",
+                   4096 <= origin_received < len(big),
+                   f"源站实收 {origin_received}"),
+        ]
+        failures += not all(ok)
     finally:
         await harness.stop()
 
@@ -161,6 +263,38 @@ async def run() -> int:
         return 1
     print("全部自测通过 ✅")
     return 0
+
+
+def _json(body: bytes) -> dict:
+    try:
+        import json
+        return json.loads(body)
+    except Exception:
+        return {}
+
+
+async def _abandon_upload(host, port, path, declared, send_first: int) -> None:
+    """发完请求头和一部分正文后直接中止连接，模拟终端中途掉线。"""
+    import h11
+
+    from app.h11io import read_event, send_event
+
+    reader, writer = await asyncio.open_connection(host, port)
+    conn = h11.Connection(our_role=h11.CLIENT)
+    await send_event(conn, writer, h11.Request(
+        method=b"POST", target=path.encode("ascii"),
+        headers=[
+            (b"host", b"t"),
+            (b"expect", b"100-continue"),
+            (b"content-length", b"1000000"),
+            (b"x-content-sha256", declared.encode("ascii")),
+        ],
+    ))
+    event = await read_event(conn, reader, 5)
+    if isinstance(event, h11.InformationalResponse):
+        await send_event(conn, writer, h11.Data(data=b"q" * send_first))
+    writer.transport.abort()
+    await asyncio.sleep(0.2)
 
 
 if __name__ == "__main__":

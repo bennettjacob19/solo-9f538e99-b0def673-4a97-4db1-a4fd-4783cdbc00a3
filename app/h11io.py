@@ -95,11 +95,15 @@ def status_phrase(status_code: int) -> bytes:
     """给 h11.Response 提供一个 reason phrase。"""
     phrases = {
         200: b"OK",
+        201: b"Created",
         400: b"Bad Request",
+        403: b"Forbidden",
         405: b"Method Not Allowed",
         408: b"Request Timeout",
         411: b"Length Required",
+        413: b"Payload Too Large",
         417: b"Expectation Failed",
+        422: b"Unprocessable Entity",
         502: b"Bad Gateway",
         504: b"Gateway Timeout",
     }

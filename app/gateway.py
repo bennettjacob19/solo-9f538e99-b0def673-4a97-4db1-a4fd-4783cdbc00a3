@@ -11,6 +11,9 @@
 * 等许可超时：网关自己回 ``504 Gateway Timeout``，不转发正文；
 * 转发正文途中源站提前给最终响应（中途拒收）：立即停止读取/转发正文，
   终端不必发完 body 就能拿到最终响应；
+* **独立的 SHA-256 校验入口** ``POST /verify``：终端在 ``X-Content-SHA256``
+  头里声明 64 位十六进制摘要；网关在许可后边转发边独立计算实际摘要，
+  收完整包后通过 HTTP trailer 把实际摘要送给源站，由源站核对三份摘要；
 * 一条连接处理完即关，不做 keep-alive 复用。
 """
 
@@ -23,6 +26,7 @@ import time
 
 import h11
 
+from . import digest
 from .config import Settings
 from .h11io import (
     PausedError,
@@ -35,6 +39,13 @@ from .h11io import (
 )
 
 log = logging.getLogger("gateway")
+
+# SHA-256 校验入口：只有这些路径会启用摘要计算与 trailer 转发
+VERIFY_PATH = "/verify"
+# 演示源站提前拒收用（网关逻辑相同；源站读到阈值后回 413）
+VERIFY_REJECT_MID_PATH = "/verify-reject-mid"
+VERIFY_PATHS = frozenset({VERIFY_PATH, VERIFY_REJECT_MID_PATH})
+
 
 
 class GatewayError(Exception):
@@ -70,6 +81,17 @@ def _validate_request(request: h11.Request) -> int:
     if length < 0:
         raise GatewayError(400, "Content-Length 不能为负数")
     return length
+
+
+def _is_verify_target(request: h11.Request) -> bool:
+    """SHA-256 校验入口的判定：只认路径（忽略 query）。
+
+    ``/verify`` 是正式入口；``/verify-reject-mid`` 是演示“源站提前拒收”
+    的同款入口（网关侧摘要/trailer 逻辑完全一致）。
+    """
+    path = request.target.decode("latin-1").split("?", 1)[0]
+    return path in VERIFY_PATHS
+
 
 
 async def _open_origin(settings: Settings) -> tuple[h11.Connection, asyncio.StreamReader,
@@ -148,29 +170,57 @@ async def _pump_body_to_origin(
     origin_writer: asyncio.StreamWriter,
     total_length: int,
     settings: Settings,
-) -> None:
-    """许可通过后：边收终端正文边转发源站，直到整条 body 发完。"""
+    *,
+    hasher=None,
+) -> str | None:
+    """许可通过后：边收终端正文边转发源站，直到整条 body 发完。
+
+    ``hasher`` 非 None 时（SHA-256 校验入口）对**实际转发**的每个字节增量
+    计算摘要，并在 ``EndOfMessage`` 的 trailer 里把实际摘要送给源站。
+    转发源站的那条腿改用 chunked，因为 h11 不允许 Content-Length 与
+    trailer 并存；终端到网关这条腿仍保持 Content-Length 语义。
+    返回实际摘要的十六进制字符串（未启用摘要时为 None）。
+    """
     remaining = total_length
+    body_done = False
     while remaining > 0:
         event = await read_event(terminal, terminal_reader, settings.idle_timeout)
         if isinstance(event, h11.Data):
             chunk = event.data
             if len(chunk) > remaining:
                 raise GatewayError(400, "请求正文超过 Content-Length 声明的长度")
+            if hasher is not None:
+                hasher.update(chunk)
             await send_event(origin, origin_writer, h11.Data(data=chunk))
             remaining -= len(chunk)
         elif isinstance(event, h11.EndOfMessage):
             if remaining != 0:
                 raise GatewayError(400, "请求正文短于 Content-Length 声明的长度")
-            await send_event(origin, origin_writer, h11.EndOfMessage())
-            return
+            body_done = True
+            break
         else:
             raise GatewayError(400, "读取请求正文时收到了意外事件")
-    # body 恰好读完，再等终端的 EndOfMessage
-    event = await read_event(terminal, terminal_reader, settings.idle_timeout)
-    if not isinstance(event, h11.EndOfMessage):
-        raise GatewayError(400, "Content-Length 已读完但未收到消息结束标记")
-    await send_event(origin, origin_writer, h11.EndOfMessage())
+
+    if not body_done:
+        # body 恰好读完，再等终端的 EndOfMessage
+        event = await read_event(terminal, terminal_reader, settings.idle_timeout)
+        if not isinstance(event, h11.EndOfMessage):
+            raise GatewayError(400, "Content-Length 已读完但未收到消息结束标记")
+
+    if hasher is None:
+        await send_event(origin, origin_writer, h11.EndOfMessage())
+        return None
+
+    # 收完整包：把网关独立算出的实际摘要放进 trailer
+    actual = hasher.hexdigest()
+    await send_event(
+        origin, origin_writer,
+        h11.EndOfMessage(
+            headers=[(digest.HEADER_NAME, actual.encode("ascii"))]
+        ),
+    )
+    return actual
+
 
 
 async def handle_terminal(
@@ -205,12 +255,28 @@ async def handle_terminal(
             )
             return
 
+        # SHA-256 校验入口：终端应在 X-Content-SHA256 里声明 64 位十六进制摘要。
+        # 网关不在这里替源站下结论——摘要缺失/格式非法时仍完整转发正文，
+        # 由源站按三份摘要判定并回 422，网关只负责转回最终响应。
+        verify = _is_verify_target(request)
+
         # ---- 阶段 2：连接源站并转发请求头（不含正文） ----------------------
         origin, origin_reader, origin_writer = await _open_origin(settings)
         forwarded_headers = filter_forward_headers(
             request.headers,
             host_value=f"{settings.origin_host}:{settings.origin_port}",
         )
+        if verify:
+            # 网关→源站改用 chunked，才能在最末尾的 trailer 里送实际摘要；
+            # 声明的 Content-Length 由网关自己按字节数校验，不转发给源站。
+            forwarded_headers = [
+                (n, v) for n, v in forwarded_headers
+                if n.lower() != b"content-length"
+            ]
+            forwarded_headers += [
+                (b"transfer-encoding", b"chunked"),
+                (b"trailer", digest.HEADER_NAME),
+            ]
         await send_event(
             origin,
             origin_writer,
@@ -252,10 +318,11 @@ async def handle_terminal(
         )
 
         # ---- 阶段 4：边收边转正文，同时监听源站的中途拒收 ------------------
+        hasher = digest.new_hasher() if verify else None
         pump_task = asyncio.create_task(
             _pump_body_to_origin(
                 terminal, terminal_reader, origin, origin_writer,
-                total_length, settings,
+                total_length, settings, hasher=hasher,
             )
         )
         relay_task = asyncio.create_task(
@@ -292,6 +359,10 @@ async def handle_terminal(
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await relay_task
                 raise exc
+            if verify:
+                actual = pump_task.result()
+                log.info("终端 %s 校验上传正文摘要 %s 已随 trailer 送达源站",
+                         peer, actual)
             await relay_task
 
     except GatewayError as exc:

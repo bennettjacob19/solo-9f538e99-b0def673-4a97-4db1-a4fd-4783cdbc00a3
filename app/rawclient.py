@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 import h11
 
+from . import digest
 from .h11io import read_event, send_event
 
 
@@ -63,8 +64,18 @@ async def upload_once(
     *,
     permission_timeout: float = 30.0,
     overall_timeout: float = 60.0,
+    body: bytes | None = None,
+    digest_value: str | None = None,
 ) -> UploadResult:
-    """发起一次 100-continue 上传，返回带时间线的结果。"""
+    """发起一次 100-continue 上传，返回带时间线的结果。
+
+    * ``body``：显式正文；为 None 时发送 ``body_size`` 个 ``b"x"``。
+      ``body_size`` 仍作为 Content-Length 声明值。
+    * ``digest_value``：非 None 时在请求头里加 ``X-Content-SHA256``，
+      值为调用方给出的字符串（用于演示“正确/错误摘要”两种情形）。
+    """
+    if body is not None:
+        body_size = len(body)
     result = UploadResult(host=host, port=port, path=path, body_size=body_size)
     start = time.monotonic()
 
@@ -116,20 +127,26 @@ async def upload_once(
 
     async def sender() -> None:
         """发循环：请求头 → 等许可 → 分块推正文（可被中途拒收打断）。"""
+        request_headers = [
+            (b"host", f"{host}:{port}".encode("ascii")),
+            (b"expect", b"100-continue"),
+            (b"content-length", str(body_size).encode("ascii")),
+            (b"connection", b"close"),
+        ]
+        if digest_value is not None:
+            request_headers.append(
+                (digest.HEADER_NAME, digest_value.encode("ascii"))
+            )
         await send_event(
             conn, writer,
             h11.Request(
                 method=b"POST",
                 target=path.encode("ascii"),
-                headers=[
-                    (b"host", f"{host}:{port}".encode("ascii")),
-                    (b"expect", b"100-continue"),
-                    (b"content-length", str(body_size).encode("ascii")),
-                    (b"connection", b"close"),
-                ],
+                headers=request_headers,
             ),
         )
-        mark("request_headers_sent", body_size=body_size)
+        mark("request_headers_sent", body_size=body_size,
+             declared_sha256=digest_value)
 
         # 关键：在源站许可到达前不发送任何正文；
         # 若最终响应（拒收/504）先到，也立即结束发送协程
@@ -157,6 +174,7 @@ async def upload_once(
             return
 
         remaining = body_size
+        offset = 0
         mark("body_send_start")
         while remaining > 0:
             # 源站已经在中途回最终响应时，立刻停止发送（终端无需发完正文）
@@ -165,7 +183,11 @@ async def upload_once(
                      bytes_sent=result.body_bytes_sent,
                      unsent=remaining)
                 return
-            chunk = b"x" * min(CHUNK_SIZE, remaining)
+            n = min(CHUNK_SIZE, remaining)
+            if body is not None:
+                chunk = body[offset:offset + n]
+            else:
+                chunk = b"x" * n
             try:
                 await send_event(conn, writer, h11.Data(data=chunk))
             except (ConnectionError, BrokenPipeError,
@@ -178,6 +200,7 @@ async def upload_once(
                 return
             result.body_bytes_sent += len(chunk)
             remaining -= len(chunk)
+            offset += len(chunk)
             # 每块之间让出事件循环，使接收协程能及时处理中途拒收
             await asyncio.sleep(0)
         await send_event(conn, writer, h11.EndOfMessage())
